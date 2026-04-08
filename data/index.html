@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Radar Monitor 2D</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <div class="app-container">
+      <!-- Header -->
+      <header>
+        <div class="logo">MẮT THẦN RADAR</div>
+        <div id="conn-status" class="status offline">ĐANG KẾT NỐI...</div>
+      </header>
+
+      <!-- Main Content -->
+      <div class="main-layout">
+        <!-- Cột trái: Bản đồ -->
+        <section class="map-box">
+          <div class="map-header">
+            <span>Bản Đồ Radar 2D</span>
+            <div class="map-mode-toggle">
+              <button id="modeViewBtn" class="mode-btn active">👁️ Xem</button>
+              <button id="modeDrawBtn" class="mode-btn">✏️ Vẽ Zone</button>
+            </div>
+          </div>
+          <canvas id="radarCanvas"></canvas>
+          <div class="map-info">
+            Tầm xa: 6m | Đơn vị: mm | Radar nằm ở giữa cạnh dưới
+          </div>
+          <div class="zone-controls">
+            <button id="btnSaveZone" class="btn-primary" style="display: none">
+              💾 Lưu Zone
+            </button>
+            <button
+              id="btnClearZone"
+              class="btn-secondary"
+              style="display: none"
+            >
+              🗑️ Xóa Zone
+            </button>
+            <button id="btnResetConfig" class="btn-danger">
+              ⟲ Reset Cấu Hình
+            </button>
+          </div>
+        </section>
+
+        <!-- Cột phải: Bảng dữ liệu & Cảnh báo -->
+        <section class="side-panel">
+          <div id="alert-box" class="alert alert-hidden">
+            <h3>⚠️ CẢNH BÁO KHẨN CẤP!</h3>
+            <p id="alert-msg">Phát hiện người ngã/ngất</p>
+            <button onclick="resetAlert()" class="btn-danger">
+              ✓ Xác Nhận & Reset
+            </button>
+          </div>
+
+          <div class="table-container">
+            <h3>📊 Thông Số Mục Tiêu</h3>
+            <table>
+              <thead>
+                <tr>
+                  <th>ID</th>
+                  <th>X, Y (mm)</th>
+                  <th>Vận tốc (mm/s)</th>
+                  <th>Trạng thái</th>
+                </tr>
+              </thead>
+              <tbody id="target-list">
+                <!-- Dữ liệu sẽ đổ vào đây -->
+              </tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </div>
+    <script src="script.js"></script>
+  </body>
+</html>
