@@ -72,6 +72,7 @@ struct TargetState {
 // ============================================================
 //                     GIAO DIỆN WEB
 // ============================================================
+
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML><html><head><meta charset="UTF-8"><title>Radar Safe Guard</title>
 <style>
@@ -88,6 +89,59 @@ const char index_html[] PROGMEM = R"rawliteral(
   @keyframes blink { 50%{ opacity:0.7; } }
   .t-name { font-weight:bold; font-size:16px; border-bottom:1px solid #eee; margin-bottom:8px; }
   .zone-info { font-size:12px; color:#666; margin-top:6px; }
+
+  /* ===== POPUP GÓC (ĐÃ SỬA) ===== */
+  #alert-overlay {
+    display:none;
+    position:fixed;
+    bottom:20px;
+    right:20px;
+    z-index:999;
+    background:none;
+  }
+
+  #alert-overlay.show {
+    display:block;
+  }
+
+  #alert-box {
+    background:#fff;
+    border-radius:12px;
+    padding:16px 18px;
+    width:260px;
+    text-align:left;
+
+    box-shadow:0 6px 20px rgba(0,0,0,0.2);
+    border-left:6px solid #dc3545;
+  }
+
+  #alert-icon { font-size:32px; margin-bottom:6px; }
+  #alert-title { font-size:16px; font-weight:bold; color:#dc3545; margin-bottom:4px; }
+  #alert-msg { font-size:13px; color:#555; margin-bottom:6px; }
+  #alert-time { font-size:11px; color:#999; margin-bottom:10px; }
+
+  #alert-ok {
+    padding:6px 14px;
+    background:#dc3545;
+    color:#fff;
+    border:none;
+    border-radius:6px;
+    font-size:13px;
+    cursor:pointer;
+  }
+
+  #alert-ok:hover { background:#b02a37; }
+
+  /* animation nhẹ */
+  #alert-overlay.show #alert-box {
+    animation:slideIn 0.3s ease;
+  }
+
+  @keyframes slideIn {
+    from { transform:translateY(20px); opacity:0; }
+    to   { transform:translateY(0); opacity:1; }
+  }
+
 </style></head><body>
 
 <div class="panel">
@@ -102,6 +156,17 @@ const char index_html[] PROGMEM = R"rawliteral(
 <div id="card-1" class="card empty">
   <div class="t-name">👤 Người theo dõi</div>
   <div id="s-1">Không phát hiện</div>
+</div>
+
+<!-- POPUP -->
+<div id="alert-overlay">
+  <div id="alert-box">
+    <div id="alert-icon">🚨</div>
+    <div id="alert-title">CẢNH BÁO</div>
+    <div id="alert-msg">Phát hiện bất thường!</div>
+    <div id="alert-time"></div>
+    <button id="alert-ok" onclick="dismissAlert()">Đã biết</button>
+  </div>
 </div>
 
 <script>
@@ -217,12 +282,93 @@ function updateUI(t){
   if(!t.valid){
     status.innerText="Không phát hiện";
     card.className="card empty";
+    hideAlert();
     return;
   }
   status.innerHTML=`<b>${t.a}</b><br>X: ${t.x} mm &nbsp; Y: ${t.y} mm<br><small>Tốc độ: ${t.spd} mm/s &nbsp; Di chuyển: ${t.dist} mm</small>`;
-  if(t.a.includes("FALL")||t.a.includes("IMMOBILE")) card.className="card danger";
-  else if(t.a.includes("FALLING")) card.className="card danger";
-  else card.className="card active";
+
+  let isDanger = (t.a === "FALL" || t.a === "IMMOBILE");;
+  if(isDanger){
+    card.className="card danger";
+    showAlert(t.a);
+  } else {
+    card.className="card active";
+    hideAlert();
+  }
+}
+
+// ── POPUP LOGIC ──────────────────────────────────────────────
+let alertDismissed = false;   // true nếu user đã bấm "Đã biết"
+let lastAlertState = "";      // trạng thái nguy hiểm hiện tại
+let alertTimerInterval = null;
+let alertStartTime = null;
+
+function showAlert(state) {
+  // Nếu đây là trạng thái nguy hiểm MỚI (khác lần trước) → reset dismiss
+  if (state !== lastAlertState) {
+    lastAlertState = state;
+    alertDismissed = false;
+    alertStartTime = Date.now();
+    startAlertTimer();
+  }
+  // Chỉ hiện popup nếu user chưa bấm "Đã biết" cho lần này
+  if (alertDismissed) return;
+
+  const overlay = document.getElementById("alert-overlay");
+  const box     = document.getElementById("alert-box");
+  const icon    = document.getElementById("alert-icon");
+  const title   = document.getElementById("alert-title");
+  const msg     = document.getElementById("alert-msg");
+
+  if (state.includes("IMMOBILE")) {
+    icon.textContent  = "🛑";
+    title.textContent = "PHÁT HIỆN NGẤT";
+    msg.textContent   = "Người theo dõi không di chuyển trong thời gian dài!";
+  } else {
+    icon.textContent  = "🚨";
+    title.textContent = "PHÁT HIỆN NGÃ";
+    msg.textContent   = "Người theo dõi có thể đã bị ngã!";
+  }
+
+  overlay.classList.add("show");
+  box.classList.add("pulsing");
+}
+
+function hideAlert() {
+  const overlay = document.getElementById("alert-overlay");
+  const box     = document.getElementById("alert-box");
+  overlay.classList.remove("show");
+  box.classList.remove("pulsing");
+  // Reset để lần cảnh báo tiếp theo hiện lại
+  lastAlertState = "";
+  alertDismissed = false;
+  stopAlertTimer();
+}
+
+function dismissAlert() {
+  // Người dùng bấm "Đã biết" – ẩn popup nhưng GIỮ trạng thái cảnh báo
+  alertDismissed = true;
+  const overlay = document.getElementById("alert-overlay");
+  const box     = document.getElementById("alert-box");
+  overlay.classList.remove("show");
+  box.classList.remove("pulsing");
+}
+
+function startAlertTimer() {
+  stopAlertTimer();
+  alertTimerInterval = setInterval(() => {
+    if (!alertStartTime) return;
+    let secs = Math.floor((Date.now() - alertStartTime) / 1000);
+    let m = String(Math.floor(secs/60)).padStart(2,"0");
+    let s = String(secs % 60).padStart(2,"0");
+    document.getElementById("alert-time").textContent = `Thời gian cảnh báo: ${m}:${s}`;
+  }, 1000);
+}
+
+function stopAlertTimer() {
+  if (alertTimerInterval) { clearInterval(alertTimerInterval); alertTimerInterval = null; }
+  document.getElementById("alert-time").textContent = "";
+  alertStartTime = null;
 }
 
 function render(){
@@ -243,8 +389,8 @@ function render(){
 
   // --- NHÃN HƯỚNG ---
   ctx.fillStyle="#ffaaaa"; ctx.font="bold 13px Arial"; ctx.textAlign="left";
-  ctx.fillText("← TRÁI", 10, 210);
-  ctx.textAlign="right"; ctx.fillText("PHẢI →", 390, 210);
+  ctx.fillText("← ", 10, 210);
+  ctx.textAlign="right"; ctx.fillText(" →", 390, 210);
   ctx.textAlign="center"; ctx.fillStyle="#aaa";
   ctx.fillText("↑ PHÍA TRƯỚC ↑", 200, 20);
 
@@ -281,7 +427,9 @@ function render(){
     ctx.fillText(lastTarget.a, px+14, py-8);
   }
 }
-</script></body></html>
+</script>
+
+</body></html>
 )rawliteral";
 
 // ============================================================
