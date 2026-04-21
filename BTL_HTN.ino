@@ -551,7 +551,7 @@ void Task_Logic(void* pvParam) {
         } else if (elapsed > 10000) {
           ts1.action = "IMMOBILE";
         } else if (elapsed > 2500) {
-          ts1.action = (ts1.smooth_doppler < 80 && distMoved < 200) ? "FALL" : "WAITING";
+          ts1.action = (ts1.smooth_doppler < 80 && distMoved < 200) ? "FALL" : "FALLING ???";
         } else {
           ts1.action = "FALLING ???";
         }
