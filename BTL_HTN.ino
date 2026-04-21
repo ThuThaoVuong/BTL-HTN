@@ -399,7 +399,7 @@ void Task_Logic(void* pvParam) {
         uint32_t elapsed = now - ts1.fall_timer;
         if (elapsed > 1000 && (ts1.smooth_doppler > 150 || distMoved > 350 || inSafe)) {
           ts1.potential_fall = false;
-          ts1.action = "DI CHUYỂN";
+          ts1.action = "MOVING";
         } else if (elapsed > 10000) {
           ts1.action = "IMMOBILE";
         } else if (elapsed > 2500) {
