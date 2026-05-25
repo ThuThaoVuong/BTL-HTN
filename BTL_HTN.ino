@@ -2,723 +2,859 @@
 #include <WiFi.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
-#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include <esp_task_wdt.h> // [THÊM] Thư viện Hardware Watchdog Timer của ESP32
+// Thư viện quản lý năng lượng của ESP32
+#include "esp_pm.h"
+#include "esp_wifi.h"
 
 // ================= CẤU HÌNH WIFI =================
-const char* ssid     = "PTIT_WIFI_KTX";
-const char* password = "PTIT@33daimo";
+const char* ssid     = "WIFI";
+const char* password = "abc";
 
-// ================= CẤU HÌNH RADAR =================
-#define RADAR_SERIAL Serial2
-#define RADAR_BAUD   115200
-#define RADAR_RX_PIN 16
-#define RADAR_TX_PIN 17
+// ================= CẤU HÌNH RADAR LD2450 =================
+#define RADAR_SERIAL    Serial2
+#define RADAR_BAUD      115200
+#define RADAR_RX_PIN    16
+#define RADAR_TX_PIN    17
 
-AsyncWebServer server(80);
-AsyncWebSocket ws("/ws");
+// ================= CẤU HÌNH ĐÈN LED VÀ NÚT BẤM CỨNG =================
+#define LED_BUILTIN_PIN  2    // Đèn LED nhỏ màu xanh có sẵn trên board ESP32
+#define BUTTON_BOOT_PIN  0    // Nút nhấn BOOT mặc định trên mạch ESP32
 
-// ================= HẰNG SỐ TRACKING =================
-#define RADAR_MAX_TARGETS 2
-#define MAX_TRACKS        2
-#define MAX_ZONES         5
-#define HISTORY_LEN       10
+// ================= GIỚI HẠN TẦM QUÉT MẶT TRƯỚC LD2450 =================
+#define MIN_Y       200    // mm – bỏ qua mục tiêu quá sát (< 20cm)
+#define MAX_Y       6000   // mm – tầm tối đa phía trước (6m)
+#define MAX_X_ABS   3500   // mm – giới hạn ngang (±3.5m)
 
-const float MATCH_DIST_MAX     = 900.0f;
-const uint32_t TRACK_HOLD_MS   = 5000;
-const uint32_t TRACK_REMOVE_MS = 8000;
-const float COST_UNMATCHED     = 3000.0f;
-const float DT_FALLBACK        = 0.10f;
+// ================= CẤU HÌNH HỆ THỐNG ĐA PHÒNG GIA LẬP =================
+#define NUM_ROOMS   3
+const char* roomNames[NUM_ROOMS] = {"Phòng Khách", "Phòng Ngủ", "Phòng Tắm"};
+uint8_t currentSelectedRoom = 0; // Phòng hiện tại hệ thống đang chọn theo dõi
 
-const float W_DIST  = 1.0f;
-const float W_SPEED = 0.35f;
-const float W_DIR   = 120.0f;
+// ================= CẤU HÌNH WATCHDOG & DIAGNOSTICS =================
+#define WDT_TIMEOUT_SECONDS   4   // Reboot chip nếu bất kỳ Task nào bị kẹt quá 4 giây
+uint32_t lastRadarPacketTime = 0; // Lưu mốc thời gian cuối cùng nhận được byte từ Radar
+bool isSensorConnected = true;    // Trạng thái kết nối của cảm biến LD2450
 
-// ================= STRUCT =================
+// ================= CẤU HÌNH TIẾT KIỆM NĂNG LƯỢNG (ECO) =================
+#define ECO_TIMEOUT_MS        20000 // 20s (20 * 1000 ms) phòng trống để vào Eco mode
+uint32_t lastTargetDetectedTime = 0; // Mốc thời gian cuối cùng phát hiện có người
+bool isEcoModeActive = false;         // Trạng thái chế độ tiết kiệm điện hiện tại
+
+// ================= FREERTOS: QUEUE & MUTEX =================
+struct RadarRaw {
+  int16_t x, y, speed;
+};
+QueueHandle_t xRadarQueue;   
+SemaphoreHandle_t xResultMutex;
+
+// ================= DỮ LIỆU KẾT QUẢ CHIA SẺ GIỮA TASK =================
+struct TargetResult {
+  int16_t  x, y;
+  int      speed;
+  int      dist;
+  String   action;
+  bool     valid;          
+} sharedResults[NUM_ROOMS];  // Mảng lưu kết quả độc lập cho từng phòng
+
+// ================= VÙNG AN TOÀN =================
+#define MAX_ZONES 5
 struct Zone {
   int16_t x_min, y_min, x_max, y_max;
   bool active = false;
 };
+Zone safeZones[NUM_ROOMS][MAX_ZONES]; // Vùng an toàn riêng biệt cho từng phòng
+int zoneCount[NUM_ROOMS] = {0, 0, 0};
+SemaphoreHandle_t xZoneMutex;  
 
+// ================= TRẠNG THÁI THEO DÕI NGƯỜI CỦA TỪNG PHÒNG =================
 struct TargetState {
-  int16_t  x_history[HISTORY_LEN] = {0};
-  int16_t  y_history[HISTORY_LEN] = {0};
-  uint8_t  h_idx = 0;
-  bool     potential_fall = false;
-  uint32_t fall_timer = 0;
-  float    smooth_doppler = 0;
-  String   action = "STILL";
-};
+  int16_t  x_history[10];
+  int16_t  y_history[10];
+  uint8_t  h_idx;
+  bool     potential_fall;
+  uint32_t fall_timer;
+  float    smooth_doppler;
+  String   action;
+  uint32_t last_seen;      
+} tsRooms[NUM_ROOMS]; // Mỗi phòng giữ một FSM trạng thái riêng biệt
 
-struct Detection {
-  bool valid = false;
-  int16_t x = 0;
-  int16_t y = 0;
-  int16_t s = 0;
-};
+// Các biến phục vụ việc sinh dữ liệu giả cho Phòng 1 và Phòng 2
+int16_t simX[NUM_ROOMS] = {0, -1000, 1200};
+int16_t simY[NUM_ROOMS] = {0, 2500, 3000};
+int16_t simDirX[NUM_ROOMS] = {0, 40, -50};
+int16_t simDirY[NUM_ROOMS] = {0, 60, -30};
 
-struct Track {
-  bool active = false;
-  uint8_t id = 0;
+// ================= WEB SERVER & WEBSOCKET =================
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
 
-  float x = 0;
-  float y = 0;
-  float vx = 0;
-  float vy = 0;
-
-  float pred_x = 0;
-  float pred_y = 0;
-
-  int16_t raw_speed = 0;
-
-  uint32_t first_seen = 0;
-  uint32_t last_seen = 0;
-  uint32_t last_update = 0;
-
-  uint16_t age_frames = 0;
-  uint16_t miss_count = 0;
-
-  bool matched_in_frame = false;
-};
-
-// ================= BIẾN TOÀN CỤC =================
-Zone safeZones[MAX_ZONES];
-int zoneCount = 0;
-
-Track tracks[MAX_TRACKS + 1];
-TargetState ts[MAX_TRACKS + 1];
-
-// ================= HTML =================
+// ============================================================
+//                     GIAO DIỆN WEB
+// ============================================================
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML><html><head><meta charset="UTF-8"><title>Radar Safe Guard</title>
 <style>
-  :root { --bg: #f0f2f5; --card: #ffffff; --text: #333; --safe: #28a745; --danger: #dc3545; }
-  body { background: var(--bg); color: var(--text); font-family: 'Segoe UI', sans-serif; text-align: center; margin: 0; padding: 10px; }
-  .panel { background: var(--card); max-width: 500px; margin: 10px auto; padding: 15px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
-  canvas { background: #fafafa; border: 1px solid #ddd; border-radius: 8px; cursor: crosshair; max-width: 100%; }
-  .btn { padding: 10px 15px; margin: 5px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 5px; font-weight: bold; }
-  .btn.active { background: #ffc107; color: black; }
-  .tracking-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; max-width: 600px; margin: auto; }
-  .card { background: var(--card); padding: 10px; border-radius: 8px; border-left: 5px solid #ccc; text-align: left; font-size: 13px; }
-  .card.active { border-left-color: var(--safe); }
-  .card.danger { border-left-color: var(--danger); background: #fff5f5; animation: blink 1s infinite; }
-  .card.ghost { border-left-color: #999; background: #f7f7f7; opacity: 0.85; }
-  @keyframes blink { 50% { opacity: 0.7; } }
-  .t-name { font-weight: bold; font-size: 15px; border-bottom: 1px solid #eee; margin-bottom: 5px; }
+  :root { --bg:#f0f2f5; --card:#ffffff; --text:#333; --safe:#28a745; --danger:#dc3545; }
+  body { background:var(--bg); color:var(--text); font-family:'Segoe UI',sans-serif; text-align:center; margin:0; padding:10px; }
+  .panel { background:var(--card); max-width:500px; margin:10px auto; padding:15px; border-radius:12px; box-shadow:0 4px 10px rgba(0,0,0,0.1); }
+  canvas { background:#fafafa; border:1px solid #ddd; border-radius:8px; cursor:crosshair; max-width:100%; }
+  .btn { padding:10px 15px; margin:5px; cursor:pointer; background:#007bff; color:white; border:none; border-radius:5px; font-weight:bold; }
+  .btn.active { background:#ffc107; color:black; }
+  
+  .room-selector { display: flex; justify-content: space-around; margin-bottom: 15px; }
+  .btn-room { padding: 10px; flex: 1; margin: 0 4px; border: 1px solid #ccc; background: #e9ecef; cursor: pointer; border-radius: 6px; font-weight: bold; }
+  .btn-room.selected { background: #007bff; color: white; border-color: #007bff; }
+
+  .card { background:var(--card); padding:15px; border-radius:8px; border-left:5px solid #ccc; text-align:left; font-size:14px; max-width:300px; margin:10px auto; }
+  .card.active { border-left-color:var(--safe); }
+  .card.danger { border-left-color:var(--danger); background:#fff5f5; animation:blink 1s infinite; }
+  .card.empty  { border-left-color:#ccc; }
+  @keyframes blink { 50%{ opacity:0.7; } }
+  .t-name { font-weight:bold; font-size:16px; border-bottom:1px solid #eee; margin-bottom:8px; }
+  .zone-info { font-size:12px; color:#666; margin-top:6px; }
+
+  #alert-overlay { display:none; position:fixed; bottom:20px; right:20px; z-index:999; background:none; }
+  #alert-overlay.show { display:block; }
+  #alert-box { background:#fff; border-radius:12px; padding:16px 18px; width:260px; text-align:left; box-shadow:0 6px 20px rgba(0,0,0,0.2); border-left:6px solid #dc3545; }
+  #alert-icon { font-size:32px; margin-bottom:6px; }
+  #alert-title { font-size:16px; font-weight:bold; color:#dc3545; margin-bottom:4px; }
+  #alert-msg { font-size:13px; color:#555; margin-bottom:6px; }
+  #alert-time { font-size:11px; color:#999; margin-bottom:10px; }
+  #alert-ok { padding:6px 14px; background:#dc3545; color:#fff; border:none; border-radius:6px; font-size:13px; cursor:pointer; }
+  #alert-ok:hover { background:#b02a37; }
+  #alert-overlay.show #alert-box { animation:slideIn 0.3s ease; }
+  @keyframes slideIn { from { transform:translateY(20px); opacity:0; } to { transform:translateY(0); opacity:1; } }
+  .sys-status-bar { display: flex; justify-content: space-between; font-size: 12px; padding: 6px 10px; background: #e9ecef; border-radius: 6px; margin-bottom: 10px; font-weight: bold; }
+  .status-ok { color: #28a745; }
+  .status-err { color: #dc3545; animation: blink 1s infinite; }
 </style></head><body>
 
-  <div class="panel">
-    <h3>HỆ THỐNG GIÁM SÁT AN TOÀN</h3>
-    <button class="btn" id="bz" onclick="startDraw()">Vẽ Vùng An Toàn</button>
-    <button class="btn" style="background:#6c757d" onclick="clearZone()">Xóa Vùng</button>
-    <br><canvas id="rd" width="400" height="400"></canvas>
+<div class="panel">
+  <h3>HỆ THỐNG GIÁM SÁT AN TOÀN TRỰC TUYẾN</h3>
+
+  <!-- [THÊM] Thanh giám sát phần cứng và tài nguyên hệ thống -->
+  <div class="sys-status-bar">
+    <span>Phần cứng: <span id="hw-status" class="status-ok">🟢 ĐỒNG BỘ</span></span>
+    <!-- [THÊM DÒNG DƯỚI] -->
+    <span>Chế độ: <span id="pwr-status" style="color:#28a745;">⚡ HIGH PERF</span></span>
+    <span>Bộ nhớ RAM: <span id="hw-heap" style="color:#007bff;">-- KB</span></span>
+  </div>
+  
+  <div class="room-selector">
+    <button class="btn-room selected" id="btn-r0" onclick="selectRoom(0)">Phòng Khách</button>
+    <button class="btn-room" id="btn-r1" onclick="selectRoom(1)">Phòng Ngủ (Sim)</button>
+    <button class="btn-room" id="btn-r2" onclick="selectRoom(2)">Phòng Tắm (Sim)</button>
   </div>
 
-  <div class="tracking-grid" id="tg">
-    <div id="card-1" class="card"><div class="t-name">Người 1</div><div id="s-1">Trống</div></div>
-    <div id="card-2" class="card"><div class="t-name">Người 2</div><div id="s-2">Trống</div></div>
+  <button class="btn" style="background:#28a745; width:100%; margin-bottom:15px; font-size:15px;" onclick="nextRoomWeb()">🔄 Đổi Phòng (Kế Tiếp)</button>
+
+  <button class="btn" id="bz" onclick="startDraw()">Vẽ Vùng An Toàn</button>
+  <button class="btn" style="background:#6c757d" onclick="clearZone()">Xóa Vùng</button>
+  <br><small id="ws-status" style="font-size:12px;color:#ffc107;">🟡 Đang kết nối…</small>
+  <br><canvas id="rd" width="400" height="400"></canvas>
+  <div class="zone-info" id="zi">Chưa có vùng an toàn</div>
+</div>
+
+<div id="card-1" class="card empty">
+  <div class="t-name">👤 Người theo dõi</div>
+  <div id="s-1">Không phát hiện</div>
+</div>
+
+<div id="alert-overlay">
+  <div id="alert-box">
+    <div id="alert-icon">🚨</div>
+    <div id="alert-title">CẢNH BÁO</div>
+    <div id="alert-msg">Phát hiện bất thường!</div>
+    <div id="alert-time"></div>
+    <button id="alert-ok" onclick="dismissAlert()">Đã biết</button>
   </div>
+</div>
 
 <script>
-  let socket = new WebSocket(`ws://${location.host}/ws`);
-  let cv = document.getElementById("rd"), ctx = cv.getContext("2d");
-  let drawing = false, isDragging = false, startX, startY, currentX, currentY;
-  let zones = [];
-  let lastTargets = [];
+let cv = document.getElementById("rd"), ctx = cv.getContext("2d");
+let drawing=false, isDragging=false, startX, startY, currentX, currentY;
+let currentRoom = 0;
+let roomZones = [[], [], []]; 
+let lastTarget = null;
+
+let socket = null;
+let reconnectTimer = null;
+let reconnectDelay = 2000;
+const MAX_DELAY = 15000;
+
+function wsConnect() {
+  if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
+  socket = new WebSocket(`ws://${location.host}/ws`);
+  setStatus("connecting");
+
+  socket.onopen = () => {
+    setStatus("online");
+    reconnectDelay = 2000;
+    clearTimeout(reconnectTimer);
+  };
 
   socket.onmessage = (e) => {
-    lastTargets = JSON.parse(e.data);
-    render();
-    updateUI(lastTargets);
-  };
+    try {
+      let data = JSON.parse(e.data);
 
-  function startDraw() {
-    drawing = true;
-    document.getElementById("bz").classList.add("active");
-  }
-
-  function clearZone() {
-    zones = [];
-    socket.send("CLEAR_ALL");
-    render();
-  }
-
-  cv.onmousedown = (e) => {
-    if(!drawing) return;
-    startX = e.offsetX;
-    startY = e.offsetY;
-    isDragging = true;
-  };
-
-  cv.onmousemove = (e) => {
-    if(isDragging) {
-      currentX = e.offsetX;
-      currentY = e.offsetY;
-      render();
-    }
-  };
-
-  cv.onmouseup = (e) => {
-    if(!isDragging) return;
-    isDragging = false;
-
-    let x1 = (startX - 200) * 30, y1 = (200 - startY) * 30;
-    let x2 = (e.offsetX - 200) * 30, y2 = (200 - e.offsetY) * 30;
-
-    let newZone = {
-      x_min: Math.min(x1, x2),
-      y_min: Math.min(y1, y2),
-      x_max: Math.max(x1, x2),
-      y_max: Math.max(y1, y2)
-    };
-    zones.push(newZone);
-
-    socket.send(`ADD_ZONE:${newZone.x_min},${newZone.y_min},${newZone.x_max},${newZone.y_max}`);
-    drawing = false;
-    document.getElementById("bz").classList.remove("active");
-    render();
-  };
-
-  function updateUI(targets) {
-    for(let i = 1; i <= 2; i++) {
-      let card = document.getElementById(`card-${i}`);
-      let status = document.getElementById(`s-${i}`);
-      if(card && status) {
-        status.innerText = "Trống";
-        card.className = "card";
-      }
-    }
-
-    targets.forEach(t => {
-      let card = document.getElementById(`card-${t.id}`);
-      let status = document.getElementById(`s-${t.id}`);
-      if(!card || !status) return;
-
-      let ghostText = t.ghost ? "<br><small>Mất dấu tạm thời...</small>" : "";
-      status.innerHTML =
-        `<b>${t.a}</b><br>X: ${t.x}, Y: ${t.y}<br><small>Move: ${t.dist}mm</small>${ghostText}`;
-
-      if (t.ghost) {
-        card.className = "card ghost";
-      } else if (t.a.includes("FALL") || t.a.includes("IMMOBILE")) {
-        card.className = "card danger";
-      } else if (t.a.includes("FALLING")) {
-        card.className = "card danger";
+      // [THÊM] Cập nhật chế độ nguồn điện động
+      if (data.power_mode === "ECO") {
+        document.getElementById("pwr-status").innerText = "🌱 ECO MODE (80MHz)";
+        document.getElementById("pwr-status").style.color = "#198754";
       } else {
-        card.className = "card active";
+        document.getElementById("pwr-status").innerText = "⚡ HIGH PERF (240MHz)";
+        document.getElementById("pwr-status").style.color = "#ffc107";
       }
-    });
-  }
 
-  function render() {
-    ctx.clearRect(0,0,400,400);
-
-    ctx.strokeStyle = "#eee";
-    ctx.lineWidth = 1;
-    for(let i = 0; i <= 400; i += 50) {
-      ctx.beginPath(); ctx.moveTo(i,0); ctx.lineTo(i,400); ctx.stroke();
-      ctx.beginPath(); ctx.moveTo(0,i); ctx.lineTo(400,i); ctx.stroke();
-    }
-
-    ctx.fillStyle = "#ffaaaa";
-    ctx.font = "bold 14px Arial";
-    ctx.textAlign = "left";
-    ctx.fillText("← BÊN TRÁI", 10, 210);
-    ctx.textAlign = "right";
-    ctx.fillText("BÊN PHẢI →", 390, 210);
-    ctx.textAlign = "center";
-    ctx.fillStyle = "#aaa";
-    ctx.fillText("↑ PHÍA TRƯỚC (XA) ↑", 200, 20);
-
-    ctx.fillStyle = "#007bff";
-    ctx.beginPath();
-    ctx.arc(200, 200, 12, 0, 7);
-    ctx.fill();
-
-    ctx.strokeStyle = "#007bff";
-    ctx.beginPath();
-    ctx.moveTo(200,200);
-    ctx.lineTo(170,170);
-    ctx.lineTo(230,170);
-    ctx.closePath();
-    ctx.stroke();
-
-    zones.forEach((z, index) => {
-      ctx.fillStyle = "rgba(40,167,69,0.15)";
-      ctx.strokeStyle = "#28a745";
-      let rx = 200 + z.x_min/30, ry = 200 - z.y_max/30;
-      let rw = (z.x_max - z.x_min)/30, rh = (z.y_max - z.y_min)/30;
-      ctx.fillRect(rx, ry, rw, rh);
-      ctx.strokeRect(rx, ry, rw, rh);
-      ctx.fillStyle = "#28a745";
-      ctx.font = "10px Arial";
-      ctx.textAlign = "left";
-      ctx.fillText("Vùng " + (index+1), rx + 5, ry + 12);
-    });
-
-    if(isDragging) {
-      ctx.strokeStyle = "#007bff";
-      ctx.setLineDash([5,5]);
-      ctx.strokeRect(startX, startY, currentX - startX, currentY - startY);
-      ctx.setLineDash([]);
-    }
-
-    lastTargets.forEach(t => {
-      let px = 200 + t.x/30;
-      let py = 200 - t.y/30;
-
-      if (t.ghost) {
-        ctx.fillStyle = "#888";
-      } else if (t.a.includes("FALL") || t.a.includes("IMMOBILE")) {
-        ctx.fillStyle = "red";
+      // [THÊM] Cập nhật chẩn đoán lỗi phần cứng từ ESP32 lên giao diện
+      if (data.hw_status === "OK") {
+        document.getElementById("hw-status").innerText = "🟢 ĐỒNG BỘ";
+        document.getElementById("hw-status").className = "status-ok";
       } else {
-        ctx.fillStyle = "#28a745";
+        document.getElementById("hw-status").innerText = "🚨 LỖI PHẦN CỨNG (UART LOST)";
+        document.getElementById("hw-status").className = "status-err";
+      }
+      if (data.free_heap) {
+        document.getElementById("hw-heap").innerText = Math.round(data.free_heap / 1024) + " KB";
+      }
+      
+      if (data.sync && data.room !== currentRoom) {
+        currentRoom = data.room;
+        updateRoomTabUI();
       }
 
-      ctx.beginPath();
-      ctx.arc(px, py, 10, 0, 7);
-      ctx.fill();
+      if (data.room === currentRoom) {
+        lastTarget = data.valid ? data : null;
+        render();
+        updateUI(data);
+      }
+    } catch(_) {}
+  };
 
-      ctx.fillStyle = "black";
-      ctx.font = "bold 12px Arial";
-      ctx.textAlign = "left";
-      ctx.fillText("T" + t.id, px + 14, py - 10);
-    });
+  socket.onclose = () => { setStatus("offline"); scheduleReconnect(); };
+  socket.onerror = () => { socket.close(); };
+}
+
+function scheduleReconnect() {
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    wsConnect();
+    reconnectDelay = Math.min(reconnectDelay * 1.5, MAX_DELAY);
+  }, reconnectDelay);
+}
+
+function wsSend(msg) {
+  if (socket && socket.readyState === WebSocket.OPEN) socket.send(msg);
+}
+
+function setStatus(state) {
+  const el = document.getElementById("ws-status");
+  if (!el) return;
+  const map = {
+    online:     { text:"🟢 Đã kết nối",   color:"#28a745" },
+    offline:    { text:"🔴 Mất kết nối – đang thử lại…", color:"#dc3545" },
+    connecting: { text:"🟡 Đang kết nối…", color:"#ffc107" },
+  };
+  const s = map[state] || map.offline;
+  el.innerText  = s.text;
+  el.style.color = s.color;
+  if (state === "offline") {
+    lastTarget = null;
+    render();
+    updateUI({ valid: false });
   }
-</script></body></html>
+}
+
+wsConnect();
+
+function nextRoomWeb() {
+  let nextId = (currentRoom + 1) % 3;
+  selectRoom(nextId);
+}
+
+function selectRoom(roomId) {
+  currentRoom = roomId;
+  updateRoomTabUI();
+  wsSend(`SELECT_ROOM:${roomId}`);
+  lastTarget = null;
+  render();
+  updateUI({ valid: false });
+}
+
+function updateRoomTabUI() {
+  for (let i = 0; i < 3; i++) {
+    let btn = document.getElementById(`btn-r${i}`);
+    if (i === currentRoom) btn.classList.add("selected");
+    else btn.classList.remove("selected");
+  }
+  let zText = roomZones[currentRoom].length > 0 ? `${roomZones[currentRoom].length} vùng an toàn đang hoạt động` : "Chưa có vùng an toàn";
+  document.getElementById("zi").innerText = zText;
+}
+
+function startDraw(){ drawing=true; document.getElementById("bz").classList.add("active"); }
+
+function clearZone(){
+  roomZones[currentRoom] = [];
+  wsSend(`CLEAR_ROOM:${currentRoom}`);
+  document.getElementById("zi").innerText="Chưa có vùng an toàn";
+  render();
+}
+
+cv.onmousedown=(e)=>{ if(!drawing) return; startX=e.offsetX; startY=e.offsetY; isDragging=true; };
+cv.onmousemove=(e)=>{ if(isDragging){ currentX=e.offsetX; currentY=e.offsetY; render(); } };
+cv.onmouseup=(e)=>{
+  if(!isDragging) return;
+  isDragging=false;
+  let x1=(startX-200)*30, y1=(200-startY)*30;
+  let x2=(e.offsetX-200)*30, y2=(200-e.offsetY)*30;
+  y1=Math.max(y1,0); y2=Math.max(y2,0);
+  let z={x_min:Math.min(x1,x2), y_min:Math.min(y1,y2), x_max:Math.max(x1,x2), y_max:Math.max(y1,y2)};
+  
+  if (roomZones[currentRoom].length < 5) {
+    roomZones[currentRoom].push(z);
+    wsSend(`ADD_ZONE_ROOM:${currentRoom},${z.x_min},${z.y_min},${z.x_max},${z.y_max}`);
+    document.getElementById("zi").innerText=`${roomZones[currentRoom].length} vùng an toàn đang hoạt động`;
+  }
+  drawing=false;
+  document.getElementById("bz").classList.remove("active");
+  render();
+};
+
+function updateUI(t){
+  let card=document.getElementById("card-1");
+  let status=document.getElementById("s-1");
+  if(!t.valid){
+    status.innerText="Không phát hiện";
+    card.className="card empty";
+    hideAlert();
+    return;
+  }
+  status.innerHTML=`<b>${t.a}</b><br>X: ${t.x} mm &nbsp; Y: ${t.y} mm<br><small>Tốc độ: ${t.spd} mm/s &nbsp; Di chuyển: ${t.dist} mm</small>`;
+
+  let isDanger = (t.a === "FALL" || t.a === "IMMOBILE");
+  if(isDanger){
+    card.className="card danger";
+    showAlert(t.a);
+  } else {
+    card.className="card active";
+    hideAlert();
+  }
+}
+
+let alertDismissed = false;   
+let lastAlertState = "";      
+let alertTimerInterval = null;
+let alertStartTime = null;
+
+function showAlert(state) {
+  if (state !== lastAlertState) {
+    lastAlertState = state;
+    alertDismissed = false;
+    alertStartTime = Date.now();
+    startAlertTimer();
+  }
+  if (alertDismissed) return;
+
+  const overlay = document.getElementById("alert-overlay");
+  const box     = document.getElementById("alert-box");
+  const icon    = document.getElementById("alert-icon");
+  const title   = document.getElementById("alert-title");
+  const msg     = document.getElementById("alert-msg");
+
+  if (state.includes("IMMOBILE")) {
+    icon.textContent  = "🛑";
+    title.textContent = "PHÁT HIỆN NGẤT";
+    msg.textContent   = "Người theo dõi không di chuyển trong thời gian dài!";
+  } else {
+    icon.textContent  = "🚨";
+    title.textContent = "PHÁT HIỆN NGÃ";
+    msg.textContent   = "Người theo dõi có thể đã bị ngã!";
+  }
+  overlay.classList.add("show");
+}
+
+function hideAlert() {
+  const overlay = document.getElementById("alert-overlay");
+  overlay.classList.remove("show");
+  lastAlertState = "";
+  alertDismissed = false;
+  stopAlertTimer();
+}
+
+function dismissAlert() {
+  alertDismissed = true;
+  document.getElementById("alert-overlay").classList.remove("show");
+}
+
+function startAlertTimer() {
+  stopAlertTimer();
+  alertTimerInterval = setInterval(() => {
+    if (!alertStartTime) return;
+    let secs = Math.floor((Date.now() - alertStartTime) / 1000);
+    let m = String(Math.floor(secs/60)).padStart(2,"0");
+    let s = String(secs % 60).padStart(2,"0");
+    document.getElementById("alert-time").textContent = `Thời gian cảnh báo: ${m}:${s}`;
+  }, 1000);
+}
+
+function stopAlertTimer() {
+  if (alertTimerInterval) { clearInterval(alertTimerInterval); alertTimerInterval = null; }
+  document.getElementById("alert-time").textContent = "";
+  alertStartTime = null;
+}
+
+function render(){
+  ctx.clearRect(0,0,400,400);
+  ctx.strokeStyle="#eee"; ctx.lineWidth=1;
+  for(let i=0;i<=400;i+=50){
+    ctx.beginPath(); ctx.moveTo(i,0); ctx.lineTo(i,400); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(0,i); ctx.lineTo(400,i); ctx.stroke();
+  }
+  ctx.fillStyle="rgba(200,200,200,0.25)";
+  ctx.fillRect(0,200,400,200);
+  ctx.fillStyle="#999"; ctx.font="11px Arial"; ctx.textAlign="center";
+  ctx.fillText("PHÍA SAU – KHÔNG THEO DÕI", 200, 370);
+
+  ctx.fillStyle="#ffaaaa"; ctx.font="bold 13px Arial"; ctx.textAlign="left";
+  ctx.fillText("← ", 10, 210);
+  ctx.textAlign="right"; ctx.fillText(" →", 390, 210);
+  ctx.textAlign="center"; ctx.fillStyle="#aaa";
+  ctx.fillText("↑ PHÍA TRƯỚC ↑", 200, 20);
+
+  ctx.fillStyle="#007bff"; ctx.beginPath(); ctx.arc(200,200,12,0,7); ctx.fill();
+  ctx.strokeStyle="#007bff"; ctx.beginPath(); ctx.moveTo(200,200); ctx.lineTo(172,172); ctx.lineTo(228,172); ctx.closePath(); ctx.stroke();
+
+  roomZones[currentRoom].forEach((z,i)=>{
+    ctx.fillStyle="rgba(40,167,69,0.15)"; ctx.strokeStyle="#28a745"; ctx.lineWidth=2;
+    let rx=200+z.x_min/30, ry=200-z.y_max/30;
+    let rw=(z.x_max-z.x_min)/30, rh=(z.y_max-z.y_min)/30;
+    ctx.fillRect(rx,ry,rw,rh); ctx.strokeRect(rx,ry,rw,rh);
+    ctx.fillStyle="#28a745"; ctx.font="10px Arial"; ctx.textAlign="left";
+    ctx.fillText("Vùng "+(i+1), rx+4, ry+12);
+  });
+
+  if(isDragging){
+    ctx.strokeStyle="#007bff"; ctx.setLineDash([5,5]); ctx.lineWidth=1;
+    ctx.strokeRect(startX,startY,currentX-startX,currentY-startY);
+    ctx.setLineDash([]);
+  }
+
+  if(lastTarget && lastTarget.valid){
+    let px=200+lastTarget.x/30, py=200-lastTarget.y/30;
+    px=Math.max(6,Math.min(394,px)); py=Math.max(6,Math.min(394,py));
+    let isDanger=lastTarget.a.includes("FALL")||lastTarget.a.includes("IMMOBILE");
+    ctx.fillStyle=isDanger?"red":"#28a745";
+    ctx.beginPath(); ctx.arc(px,py,10,0,7); ctx.fill();
+    ctx.fillStyle="black"; ctx.font="bold 11px Arial"; ctx.textAlign="left";
+    ctx.fillText(lastTarget.a, px+14, py-8);
+  }
+}
+</script>
+</body></html>
 )rawliteral";
 
-// ================= PROTOTYPE =================
-bool checkIfInAnySafeZone(int16_t x, int16_t y);
-void onWsEvent(AsyncWebSocket *s, AsyncWebSocketClient *c, AwsEventType t, void *arg, uint8_t *d, size_t l);
-void processTarget(int16_t x, int16_t y, int16_t s, int id, JsonArray& root);
-void handleRadar();
-
-float calcDistance(float x1, float y1, float x2, float y2);
-float calcDirectionDiff(float vx1, float vy1, float vx2, float vy2);
-void decodeRadarFrame(uint8_t* buf, Detection dets[RADAR_MAX_TARGETS], int &detCount);
-void predictTracks(uint32_t now);
-float computeMatchCost(const Track& tr, const Detection& det);
-void assignDetectionsToTracks(Detection dets[RADAR_MAX_TARGETS], int detCount, uint32_t now);
-int getFreeTrackId();
-void initTrackFromDetection(Track& tr, const Detection& det, uint32_t now, uint8_t id);
-void updateTrackWithDetection(Track& tr, const Detection& det, uint32_t now);
-void updateUnmatchedTracks(uint32_t now);
-void publishTracks();
-void solveAssignmentBruteforce(float cost[MAX_TRACKS][RADAR_MAX_TARGETS], bool trackUsable[MAX_TRACKS], bool detUsable[RADAR_MAX_TARGETS], int detCount, int bestAssign[MAX_TRACKS]);
-
-// ================= HÀM HỖ TRỢ =================
-float calcDistance(float x1, float y1, float x2, float y2) {
-  float dx = x1 - x2;
-  float dy = y1 - y2;
-  return sqrtf(dx * dx + dy * dy);
-}
-
-float calcDirectionDiff(float vx1, float vy1, float vx2, float vy2) {
-  float mag1 = sqrtf(vx1 * vx1 + vy1 * vy1);
-  float mag2 = sqrtf(vx2 * vx2 + vy2 * vy2);
-
-  if (mag1 < 1.0f || mag2 < 1.0f) return 0.0f;
-
-  float dot = vx1 * vx2 + vy1 * vy2;
-  float c = dot / (mag1 * mag2);
-  if (c > 1.0f) c = 1.0f;
-  if (c < -1.0f) c = -1.0f;
-
-  return acosf(c);
-}
-
-bool checkIfInAnySafeZone(int16_t x, int16_t y) {
+// ============================================================
+//            HÀM TIỆN ÍCH KIỂM TRA VÙNG AN TOÀN ĐA PHÒNG
+// ============================================================
+bool checkIfInAnySafeZone(uint8_t r_id, int16_t x, int16_t y) {
   for (int i = 0; i < MAX_ZONES; i++) {
-    if (safeZones[i].active) {
-      if (x >= safeZones[i].x_min && x <= safeZones[i].x_max &&
-          y >= safeZones[i].y_min && y <= safeZones[i].y_max) {
-        return true;
-      }
+    if (safeZones[r_id][i].active &&
+        x >= safeZones[r_id][i].x_min && x <= safeZones[r_id][i].x_max &&
+        y >= safeZones[r_id][i].y_min && y <= safeZones[r_id][i].y_max) {
+      return true;
     }
   }
   return false;
 }
 
-// ================= XỬ LÝ NGÃ =================
-void processTarget(int16_t x, int16_t y, int16_t s, int id, JsonArray& root) {
-  TargetState& t = ts[id];
-  uint32_t now = millis();
-
-  y = -y;
-
-  int16_t x_old = t.x_history[t.h_idx];
-  int16_t y_old = t.y_history[t.h_idx];
-
-  t.x_history[t.h_idx] = x;
-  t.y_history[t.h_idx] = y;
-  t.h_idx = (t.h_idx + 1) % HISTORY_LEN;
-
-  float distanceMoved = sqrtf(powf(x - x_old, 2) + powf(y - y_old, 2));
-  float vY = (y - y_old) * 1.0f;
-
-  t.smooth_doppler = (t.smooth_doppler * 0.7f) + (abs(s) * 0.3f);
-
-  bool inSafeZone = checkIfInAnySafeZone(x, y);
-
-  if (!t.potential_fall && !inSafeZone) {
-    if (vY < -250 && (t.smooth_doppler > 100 || distanceMoved > 250)) {
-      t.potential_fall = true;
-      t.fall_timer = now;
-    }
-  }
-
-  if (t.potential_fall) {
-    uint32_t elapsed = now - t.fall_timer;
-
-    if (elapsed > 1000 && (t.smooth_doppler > 150 || distanceMoved > 350 || inSafeZone)) {
-      t.potential_fall = false;
-      t.action = "MOVING";
-    }
-    else if (elapsed > 10000) {
-      t.action = "IMMOBILE";
-    }
-    else if (elapsed > 2500) {
-      if (t.smooth_doppler < 80 && distanceMoved < 200) t.action = "FALL";
-      else t.action = "WAITING";
-    }
-    else {
-      t.action = "FALLING ???";
-    }
-  } else {
-    t.action = (t.smooth_doppler > 35 || distanceMoved > 120) ? "MOVING" : "STILL";
-  }
-
-  JsonObject obj = root.createNestedObject();
-  obj["id"] = id;
-  obj["x"] = x;
-  obj["y"] = y;
-  obj["spd"] = (int)t.smooth_doppler;
-  obj["dist"] = (int)distanceMoved;
-  obj["a"] = t.action;
-  obj["ghost"] = false;
-}
-
-// ================= DECODE RADAR: CHỈ ĐỌC 2 TARGET =================
-void decodeRadarFrame(uint8_t* buf, Detection dets[RADAR_MAX_TARGETS], int &detCount) {
-  detCount = 0;
-
-  for (int j = 0; j < RADAR_MAX_TARGETS; j++) {
-    int off = 4 + (j * 8);
-
-    int16_t raw_x = (buf[off + 1] & 0x80)
-      ? -(((buf[off + 1] & 0x7F) << 8) | buf[off])
-      : (((buf[off + 1] & 0x7F) << 8) | buf[off]);
-
-    int16_t raw_y = (buf[off + 3] & 0x80)
-      ? -(((buf[off + 3] & 0x7F) << 8) | buf[off + 2])
-      : (((buf[off + 3] & 0x7F) << 8) | buf[off + 2]);
-
-    int16_t raw_s = (buf[off + 5] & 0x80)
-      ? -(((buf[off + 5] & 0x7F) << 8) | buf[off + 4])
-      : (((buf[off + 5] & 0x7F) << 8) | buf[off + 4]);
-
-    if (raw_x == 0 && raw_y == 0) continue;
-
-    dets[detCount].valid = true;
-    dets[detCount].x = raw_x;
-    dets[detCount].y = raw_y;
-    dets[detCount].s = raw_s;
-    detCount++;
-  }
-}
-
-// ================= TRACKING =================
-void predictTracks(uint32_t now) {
-  for (int i = 1; i <= MAX_TRACKS; i++) {
-    if (!tracks[i].active) continue;
-
-    float dt = (now - tracks[i].last_update) / 1000.0f;
-    if (dt <= 0.0f || dt > 1.0f) dt = DT_FALLBACK;
-
-    tracks[i].pred_x = tracks[i].x + tracks[i].vx * dt;
-    tracks[i].pred_y = tracks[i].y + tracks[i].vy * dt;
-    tracks[i].matched_in_frame = false;
-  }
-}
-
-float computeMatchCost(const Track& tr, const Detection& det) {
-  float dist = calcDistance(tr.pred_x, tr.pred_y, det.x, det.y);
-  if (dist > MATCH_DIST_MAX) return COST_UNMATCHED;
-
-  float det_vx = det.x - tr.x;
-  float det_vy = det.y - tr.y;
-  float speedDiff = fabsf((float)abs(det.s) - (float)abs(tr.raw_speed));
-  float dirDiff = calcDirectionDiff(tr.vx, tr.vy, det_vx, det_vy);
-
-  return (W_DIST * dist) + (W_SPEED * speedDiff) + (W_DIR * dirDiff);
-}
-
-void solveAssignmentBruteforce(float cost[MAX_TRACKS][RADAR_MAX_TARGETS],
-                               bool trackUsable[MAX_TRACKS],
-                               bool detUsable[RADAR_MAX_TARGETS],
-                               int detCount,
-                               int bestAssign[MAX_TRACKS]) {
-  int currentAssign[MAX_TRACKS];
-  bool usedDet[RADAR_MAX_TARGETS] = {false, false};
-  float bestTotal = 1e9f;
-
-  for (int i = 0; i < MAX_TRACKS; i++) {
-    bestAssign[i] = -1;
-    currentAssign[i] = -1;
-  }
-
-  std::function<void(int, float)> dfs = [&](int ti, float curTotal) {
-    if (curTotal >= bestTotal) return;
-
-    if (ti == MAX_TRACKS) {
-      if (curTotal < bestTotal) {
-        bestTotal = curTotal;
-        for (int i = 0; i < MAX_TRACKS; i++) bestAssign[i] = currentAssign[i];
-      }
-      return;
-    }
-
-    if (!trackUsable[ti]) {
-      currentAssign[ti] = -1;
-      dfs(ti + 1, curTotal);
-      return;
-    }
-
-    currentAssign[ti] = -1;
-    dfs(ti + 1, curTotal + COST_UNMATCHED);
-
-    for (int dj = 0; dj < detCount; dj++) {
-      if (!detUsable[dj] || usedDet[dj]) continue;
-      if (cost[ti][dj] >= COST_UNMATCHED) continue;
-
-      usedDet[dj] = true;
-      currentAssign[ti] = dj;
-      dfs(ti + 1, curTotal + cost[ti][dj]);
-      usedDet[dj] = false;
-      currentAssign[ti] = -1;
-    }
-  };
-
-  dfs(0, 0.0f);
-}
-
-void initTrackFromDetection(Track& tr, const Detection& det, uint32_t now, uint8_t id) {
-  tr.active = true;
-  tr.id = id;
-  tr.x = det.x;
-  tr.y = det.y;
-  tr.vx = 0;
-  tr.vy = 0;
-  tr.pred_x = det.x;
-  tr.pred_y = det.y;
-  tr.raw_speed = det.s;
-  tr.first_seen = now;
-  tr.last_seen = now;
-  tr.last_update = now;
-  tr.age_frames = 1;
-  tr.miss_count = 0;
-  tr.matched_in_frame = true;
-}
-
-void updateTrackWithDetection(Track& tr, const Detection& det, uint32_t now) {
-  float dt = (now - tr.last_update) / 1000.0f;
-  if (dt <= 0.0f || dt > 1.0f) dt = DT_FALLBACK;
-
-  float newVx = (det.x - tr.x) / dt;
-  float newVy = (det.y - tr.y) / dt;
-
-  tr.vx = tr.vx * 0.65f + newVx * 0.35f;
-  tr.vy = tr.vy * 0.65f + newVy * 0.35f;
-
-  tr.x = det.x;
-  tr.y = det.y;
-  tr.raw_speed = det.s;
-  tr.last_seen = now;
-  tr.last_update = now;
-  tr.age_frames++;
-  tr.miss_count = 0;
-  tr.matched_in_frame = true;
-}
-
-int getFreeTrackId() {
-  for (int i = 1; i <= MAX_TRACKS; i++) {
-    if (!tracks[i].active) return i;
-  }
-  return -1;
-}
-
-void assignDetectionsToTracks(Detection dets[RADAR_MAX_TARGETS], int detCount, uint32_t now) {
-  float cost[MAX_TRACKS][RADAR_MAX_TARGETS];
-  bool trackUsable[MAX_TRACKS];
-  bool detUsable[RADAR_MAX_TARGETS];
-  int bestAssign[MAX_TRACKS];
-  bool detAssigned[RADAR_MAX_TARGETS] = {false, false};
-
-  for (int ti = 0; ti < MAX_TRACKS; ti++) {
-    int id = ti + 1;
-    trackUsable[ti] = tracks[id].active;
-    for (int dj = 0; dj < RADAR_MAX_TARGETS; dj++) {
-      cost[ti][dj] = COST_UNMATCHED;
-    }
-  }
-
-  for (int dj = 0; dj < RADAR_MAX_TARGETS; dj++) {
-    detUsable[dj] = (dj < detCount && dets[dj].valid);
-  }
-
-  for (int ti = 0; ti < MAX_TRACKS; ti++) {
-    int id = ti + 1;
-    if (!tracks[id].active) continue;
-
-    for (int dj = 0; dj < detCount; dj++) {
-      if (!dets[dj].valid) continue;
-      cost[ti][dj] = computeMatchCost(tracks[id], dets[dj]);
-    }
-  }
-
-  solveAssignmentBruteforce(cost, trackUsable, detUsable, detCount, bestAssign);
-
-  for (int ti = 0; ti < MAX_TRACKS; ti++) {
-    int id = ti + 1;
-    if (!tracks[id].active) continue;
-
-    int dj = bestAssign[ti];
-    if (dj >= 0 && dj < detCount && cost[ti][dj] < COST_UNMATCHED) {
-      updateTrackWithDetection(tracks[id], dets[dj], now);
-      detAssigned[dj] = true;
-    }
-  }
-
-  for (int dj = 0; dj < detCount; dj++) {
-    if (!dets[dj].valid || detAssigned[dj]) continue;
-
-    int freeId = getFreeTrackId();
-    if (freeId != -1) {
-      initTrackFromDetection(tracks[freeId], dets[dj], now, freeId);
-    }
-  }
-}
-
-void updateUnmatchedTracks(uint32_t now) {
-  for (int i = 1; i <= MAX_TRACKS; i++) {
-    if (!tracks[i].active) continue;
-
-    if (!tracks[i].matched_in_frame) {
-      tracks[i].miss_count++;
-
-      uint32_t lostMs = now - tracks[i].last_seen;
-      if (lostMs > TRACK_REMOVE_MS) {
-        tracks[i] = Track();
-        ts[i] = TargetState();
-      }
-    }
-  }
-}
-
-void publishTracks() {
-  StaticJsonDocument<768> doc;
-  JsonArray arr = doc.to<JsonArray>();
-  uint32_t now = millis();
-
-  for (int i = 1; i <= MAX_TRACKS; i++) {
-    if (!tracks[i].active) continue;
-
-    uint32_t lostMs = now - tracks[i].last_seen;
-    bool isGhost = lostMs > 400 && lostMs <= TRACK_HOLD_MS;
-
-    if (!isGhost) {
-      processTarget((int16_t)tracks[i].x, (int16_t)tracks[i].y, tracks[i].raw_speed, i, arr);
-    } else {
-      JsonObject obj = arr.createNestedObject();
-      obj["id"] = i;
-      obj["x"] = (int)tracks[i].x;
-      obj["y"] = (int)tracks[i].y;
-      obj["spd"] = (int)abs(tracks[i].raw_speed);
-      obj["dist"] = 0;
-      obj["a"] = "STILL";
-      obj["ghost"] = true;
-    }
-  }
-
-  String out;
-  serializeJson(doc, out);
-  ws.textAll(out);
-}
-
-// ================= HANDLE RADAR =================
-void handleRadar() {
+// ============================================================
+//   TASK 1 – Task_Radar (Core 0, Priority 3) – ĐỌC UART RADAR
+// ============================================================
+void Task_Radar(void* pvParam) {
+  esp_task_wdt_add(NULL); // [THÊM] Đăng ký Task_Radar vào Hardware Watchdog
   static uint8_t buf[30];
   static uint8_t idx = 0;
 
-  while (RADAR_SERIAL.available()) {
-    uint8_t b = RADAR_SERIAL.read();
+  for (;;) {
+    esp_task_wdt_reset(); // [THÊM] Reset Watchdog ở mỗi chu kỳ lặp
+    while (RADAR_SERIAL.available()) {
+      uint8_t b = RADAR_SERIAL.read();
+      if (idx == 0 && b != 0xAA) continue;
+      buf[idx++] = b;
 
-    if (idx == 0 && b != 0xAA) continue;
-    buf[idx++] = b;
+      if (idx == 30) {
+        idx = 0;
+        if (buf[1] != 0xFF || buf[28] != 0x55) continue;
 
-    if (idx == 30) {
-      if (buf[1] == 0xFF && buf[28] == 0x55) {
-        Detection dets[RADAR_MAX_TARGETS];
-        int detCount = 0;
-        uint32_t now = millis();
+        // [THÊM] Nhận đúng cấu trúc gói tin của LD2450 -> Cập nhật nhịp tim phần cứng ngay
+        lastRadarPacketTime = millis();
+        isSensorConnected = true;
 
-        decodeRadarFrame(buf, dets, detCount);
-        predictTracks(now);
-        assignDetectionsToTracks(dets, detCount, now);
-        updateUnmatchedTracks(now);
-        publishTracks();
+        for (int j = 0; j < 3; j++) {
+          int off = 4 + j * 8;
+          int16_t rx = (buf[off+1] & 0x80)
+                       ? -((int16_t)(buf[off+1] & 0x7F) << 8 | buf[off])
+                       :  ((int16_t)(buf[off+1] & 0x7F) << 8 | buf[off]);
+          int16_t ry = (buf[off+3] & 0x80)
+                       ? -((int16_t)(buf[off+3] & 0x7F) << 8 | buf[off+2])
+                       :  ((int16_t)(buf[off+3] & 0x7F) << 8 | buf[off+2]);
+          int16_t rs = (buf[off+5] & 0x80)
+                       ? -((int16_t)(buf[off+5] & 0x7F) << 8 | buf[off+4])
+                       :  ((int16_t)(buf[off+5] & 0x7F) << 8 | buf[off+4]);
+
+          if (rx == 0 && ry == 0) continue; 
+
+          int16_t fy = -ry;  
+          if (fy < MIN_Y || fy > MAX_Y)       continue; 
+          if (abs(rx) > MAX_X_ABS)            continue; 
+
+          RadarRaw raw = { rx, ry, rs };
+          xQueueSend(xRadarQueue, &raw, 0);
+          break; 
+        }
       }
-      idx = 0;
+    }
+    vTaskDelay(pdMS_TO_TICKS(5)); 
+  }
+}
+
+// ============================================================
+//   TASK 2 – Task_Logic (Core 0, Priority 2) – FSM ĐA PHÒNG GIA LẬP
+// ============================================================
+void Task_Logic(void* pvParam) {
+  esp_task_wdt_add(NULL); // [THÊM] Đăng ký Task_Logic vào Hardware Watchdog
+  RadarRaw raw;
+
+  for (;;) {
+    esp_task_wdt_reset(); // [THÊM] Reset Watchdog
+    uint8_t r_id = currentSelectedRoom; 
+    uint32_t now = millis();
+
+    // [THÊM] Chẩn đoán liên tục: Nếu quá 3000ms không có dữ liệu UART -> Cảm biến hỏng/lỏng dây
+    if (now - lastRadarPacketTime > 3000) {
+      isSensorConnected = false;
+    }
+    // Khai báo một biến cờ để kiểm tra trạng thái phòng
+    bool roomHasPeople = false;
+
+    // ─── TRƯỜNG HỢP PHÒNG 0: ĐỌC DỮ LIỆU THẬT TỪ RADAR ───
+    if (r_id == 0) {
+      // [THÊM TRƯỜNG HỢP LỖI PHẦN CỨNG] Nếu đang xem phòng thật mà cảm biến chết
+      if (!isSensorConnected) {
+        if (xSemaphoreTake(xResultMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          sharedResults[0].valid = true; 
+          sharedResults[0].action = "⚠️ LỖI PHẦN CỨNG: MẤT RADAR";
+          sharedResults[0].x = 0; sharedResults[0].y = 0; sharedResults[0].speed = 0;
+          xSemaphoreGive(xResultMutex);
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+        continue; // Bỏ qua phân tích FSM phía dưới vì radar đã mất kết nối
+      }
+
+      if (xQueueReceive(xRadarQueue, &raw, pdMS_TO_TICKS(60)) == pdTRUE) {
+        TargetState* ts = &tsRooms[0];
+        int16_t x = raw.x;
+        int16_t y = -raw.y; 
+        int16_t s = raw.speed;
+
+        roomHasPeople = true;
+        
+
+        int16_t x_old = ts->x_history[ts->h_idx];
+        int16_t y_old = ts->y_history[ts->h_idx];
+        ts->x_history[ts->h_idx] = x;
+        ts->y_history[ts->h_idx] = y;
+        ts->h_idx = (ts->h_idx + 1) % 10;
+
+        float distMoved  = sqrtf(powf(x - x_old, 2) + powf(y - y_old, 2));
+        float vY         = (float)(y - y_old);
+        ts->smooth_doppler = ts->smooth_doppler * 0.7f + fabsf(s) * 0.3f;
+        ts->last_seen    = now;
+
+        bool inSafe = false;
+        if (xSemaphoreTake(xZoneMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          inSafe = checkIfInAnySafeZone(0, x, y);
+          xSemaphoreGive(xZoneMutex);
+        }
+
+        if (!ts->potential_fall && !inSafe) {
+          if (vY < -250 && (ts->smooth_doppler > 100 || distMoved > 250)) {
+            ts->potential_fall = true;
+            ts->fall_timer     = now;
+          }
+        }
+
+        if (ts->potential_fall) {
+          uint32_t elapsed = now - ts->fall_timer;
+          if (elapsed > 1000 && (ts->smooth_doppler > 150 || distMoved > 350 || inSafe)) {
+            ts->potential_fall = false;
+            ts->action = "MOVING";
+          } else if (elapsed > 10000) {
+            ts->action = "IMMOBILE";
+          } else if (elapsed > 2500) {
+            ts->action = (ts->smooth_doppler < 80 && distMoved < 200) ? "FALL" : "FALLING ???";
+          } else {
+            ts->action = "FALLING ???";
+          }
+        } else {
+          ts->action = (ts->smooth_doppler > 35 || distMoved > 120) ? "MOVING" : "STILL";
+        }
+
+        if (xSemaphoreTake(xResultMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          sharedResults[0] = { x, y, (int)ts->smooth_doppler, (int)distMoved, ts->action, true };
+          xSemaphoreGive(xResultMutex);
+        }
+      } else {
+        // Mất mục tiêu thật phòng 0
+        if (xSemaphoreTake(xResultMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          sharedResults[0].valid = false;
+          xSemaphoreGive(xResultMutex);
+        }
+        if (millis() - tsRooms[0].last_seen > 3000) {
+          tsRooms[0].potential_fall = false;
+          tsRooms[0].smooth_doppler = 0;
+        }
+      }
+    } 
+    // ─── TRƯỜNG HỢP PHÒNG 1 HOẶC 2: TỰ SINH DỮ LIỆU GIẢ LẬP ───
+    else {
+      vTaskDelay(pdMS_TO_TICKS(100)); // Chu kỳ sinh dữ liệu mô phỏng 100ms
+      
+      // Cho điểm di chuyển tịnh tiến tuần hoàn tự động
+      simX[r_id] += simDirX[r_id];
+      simY[r_id] += simDirY[r_id];
+
+      // Đảo hướng nếu chạm biên vùng quét ảo để tạo hiệu ứng di chuyển qua lại
+      if (abs(simX[r_id]) > 2500) simDirX[r_id] = -simDirX[r_id];
+      if (simY[r_id] < 1000 || simY[r_id] > 5000) simDirY[r_id] = -simDirY[r_id];
+
+      TargetState* ts = &tsRooms[r_id];
+      int16_t x = simX[r_id];
+      int16_t y = simY[r_id];
+
+      // Giả lập trạng thái phòng 1 khác phòng 2 (Ví dụ: Phòng 2 thi thoảng giả ngã)
+      if (r_id == 2 && random(0, 150) == 25 && !ts->potential_fall) {
+         ts->potential_fall = true;
+         ts->fall_timer = millis();
+         ts->action = "FALL";
+      }
+
+      if (ts->potential_fall) {
+         if (millis() - ts->fall_timer > 6000) { // Sau 6 giây đứng dậy đi tiếp
+            ts->potential_fall = false;
+            ts->action = "MOVING";
+         }
+      } else {
+         ts->action = "MOVING";
+      }
+
+      if (xSemaphoreTake(xResultMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        sharedResults[r_id] = { x, y, (int)random(40, 90), (int)random(100, 200), ts->action, true };
+        xSemaphoreGive(xResultMutex);
+        if (sharedResults[r_id].valid) {
+          roomHasPeople = true;
+        }
+      }
+    }
+
+    if (roomHasPeople) {
+      lastTargetDetectedTime = now; // Cập nhật mốc thời gian có người gần nhất
+      
+      // Nếu đang ở chế độ Eco mà có chuyển động -> ĐẨY HIỆU NĂNG LÊN NGAY (Thức giấc)
+      if (isEcoModeActive) {
+        setCpuFrequencyMhz(240); // Đẩy xung nhịp lên tối đa 240MHz để xử lý mượt mà
+        esp_wifi_set_ps(WIFI_PS_NONE); // Tắt tiết kiệm điện WiFi để Web phản hồi tức thì
+        isEcoModeActive = false;
+        Serial.println("[POWER] Phát hiện chuyển động! Đã khôi phục hiệu năng cao (240MHz).");
+      }
+    } 
+    else {
+      // Nếu phòng trống liên tục vượt quá thời gian cấu hình (5 phút) -> KÍCH HOẠT CHẾ ĐỘ ECO
+      if (!isEcoModeActive && (now - lastTargetDetectedTime > ECO_TIMEOUT_MS)) {
+        setCpuFrequencyMhz(80); // Hạ xung nhịp xuống 80MHz (Mức tối thiểu để duy trì WiFi/UART ổn định)
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM); // Bật chế độ Modem-Sleep cho bộ thu phát WiFi
+        isEcoModeActive = true;
+        Serial.println("[POWER] DEMO Phòng trống không có ai > 20s. Kích hoạt chế độ ECO (80MHz + Modem-Sleep) thành công.");
+      }
+    }
+
+  }
+  
+}
+
+// ============================================================
+//   TASK 3 – Task_WebServer (Core 1) – CHỐP LED + LIÊN KẾT ĐỒNG BỘ
+// ============================================================
+void onWsEvent(AsyncWebSocket* s, AsyncWebSocketClient* c,
+               AwsEventType t, void* arg, uint8_t* d, size_t l) {
+  if (t != WS_EVT_DATA) return;
+  String m = "";
+  for (size_t i = 0; i < l; i++) m += (char)d[i];
+
+  if (m.startsWith("SELECT_ROOM:")) {
+    uint8_t targetRoom = m.substring(12).toInt();
+    if (targetRoom < NUM_ROOMS) {
+      currentSelectedRoom = targetRoom;
+      Serial.printf("[WEB EVENT] Đã nhận lệnh chuyển màn hình sang: %s\n", roomNames[currentSelectedRoom]);
+      
+      digitalWrite(LED_BUILTIN_PIN, HIGH);
+      vTaskDelay(pdMS_TO_TICKS(70));
+      digitalWrite(LED_BUILTIN_PIN, LOW);
+    }
+  }
+  else if (m.startsWith("ADD_ZONE_ROOM:")) {
+    if (xSemaphoreTake(xZoneMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+      uint8_t r_id;
+      int16_t x1, y1, x2, y2;
+      sscanf(m.substring(14).c_str(), "%hhu,%hd,%hd,%hd,%hd", &r_id, &x1, &y1, &x2, &y2);
+      if (r_id < NUM_ROOMS && zoneCount[r_id] < MAX_ZONES) {
+        safeZones[r_id][zoneCount[r_id]++] = { x1, y1, x2, y2, true };
+        Serial.printf("Đã thêm vùng cho %s #%d\n", roomNames[r_id], zoneCount[r_id]);
+      }
+      xSemaphoreGive(xZoneMutex);
+    }
+  } else if (m.startsWith("CLEAR_ROOM:")) {
+    uint8_t r_id = m.substring(11).toInt();
+    if (r_id < NUM_ROOMS) {
+      if (xSemaphoreTake(xZoneMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+        for (int i = 0; i < MAX_ZONES; i++) safeZones[r_id][i].active = false;
+        zoneCount[r_id] = 0;
+        xSemaphoreGive(xZoneMutex);
+      }
+      Serial.printf("Đã xóa vùng an toàn của %s\n", roomNames[r_id]);
     }
   }
 }
 
-// ================= WEBSOCKET =================
-void onWsEvent(AsyncWebSocket *s, AsyncWebSocketClient *c, AwsEventType t, void *arg, uint8_t *d, size_t l) {
-  if (t == WS_EVT_DATA) {
-    String m = "";
-    for (size_t i = 0; i < l; i++) m += (char)d[i];
-
-    if (m.startsWith("ADD_ZONE:")) {
-      if (zoneCount < MAX_ZONES) {
-        int16_t x1, y1, x2, y2;
-        sscanf(m.substring(9).c_str(), "%hd,%hd,%hd,%hd", &x1, &y1, &x2, &y2);
-        safeZones[zoneCount] = {x1, y1, x2, y2, true};
-        zoneCount++;
-      }
-    } else if (m == "CLEAR_ALL") {
-      for (int i = 0; i < MAX_ZONES; i++) safeZones[i].active = false;
-      zoneCount = 0;
-    }
-  }
-}
-
-// ================= SETUP / LOOP =================
-void setup() {
-  Serial.begin(115200);
-  RADAR_SERIAL.begin(RADAR_BAUD, SERIAL_8N1, RADAR_RX_PIN, RADAR_TX_PIN);
-
+void Task_WebServer(void* pvParam) {
   WiFi.begin(ssid, password);
+  Serial.print("Đang kết nối WiFi");
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+    vTaskDelay(pdMS_TO_TICKS(500));
     Serial.print(".");
   }
-  Serial.println();
-  Serial.print("IP: ");
-  Serial.println(WiFi.localIP());
+  Serial.print("\nIP: "); Serial.println(WiFi.localIP());
+
+  pinMode(LED_BUILTIN_PIN, OUTPUT);
+  pinMode(BUTTON_BOOT_PIN, INPUT_PULLUP);
+  digitalWrite(LED_BUILTIN_PIN, LOW); 
 
   ws.onEvent(onWsEvent);
   server.addHandler(&ws);
-
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *r) {
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* r) {
     r->send_P(200, "text/html", index_html);
   });
-
   server.begin();
-  Serial.println("Server started");
+  Serial.println("Web server đã khởi động");
+
+  esp_task_wdt_add(NULL); // [THÊM] Đăng ký Task Web vào Hardware Watchdog
+
+  unsigned long lastDebounceTime = 0;
+  const unsigned long debounceDelay = 350; 
+  uint8_t lastRoomStatus = currentSelectedRoom; 
+
+  for (;;) {
+    esp_task_wdt_reset(); // [THÊM] Reset Watchdog
+
+    if (digitalRead(BUTTON_BOOT_PIN) == LOW) {
+      if ((millis() - lastDebounceTime) > debounceDelay) {
+        lastDebounceTime = millis();
+        
+        currentSelectedRoom = (currentSelectedRoom + 1) % NUM_ROOMS;
+        Serial.printf("[NÚT BOOT ESP32] Bấm chuyển mạch sang: %s\n", roomNames[currentSelectedRoom]);
+
+        digitalWrite(LED_BUILTIN_PIN, HIGH); 
+        vTaskDelay(pdMS_TO_TICKS(70));       
+        digitalWrite(LED_BUILTIN_PIN, LOW);  
+      }
+    }
+
+    if (ws.count() > 0) { 
+      uint8_t r_id = currentSelectedRoom; 
+      TargetResult res;
+
+      if (xSemaphoreTake(xResultMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+        res = sharedResults[r_id];
+        xSemaphoreGive(xResultMutex);
+      }
+
+      StaticJsonDocument<256> doc;
+      doc["room"]  = r_id; 
+      doc["valid"] = res.valid;
+
+      // [THÊM] Đóng gói trạng thái chẩn đoán hệ thống thực tế vào JSON gửi đi
+      doc["hw_status"] = isSensorConnected ? "OK" : "ERROR";
+      // [THÊM] Gửi trạng thái chế độ nguồn điện hiện tại lên giao diện
+      doc["power_mode"] = isEcoModeActive ? "ECO" : "HIGH";
+      doc["free_heap"] = ESP.getFreeHeap(); // Trả về số byte RAM còn trống thực tế của vi xử lý
+      
+      if (r_id != lastRoomStatus) {
+        doc["sync"] = true;
+        lastRoomStatus = r_id;
+      } else {
+        doc["sync"] = false;
+      }
+
+      if (res.valid) {
+        doc["x"]    = res.x;
+        doc["y"]    = res.y;
+        doc["spd"]  = res.speed;
+        doc["dist"] = res.dist;
+        doc["a"]    = res.action;
+      }
+      String out;
+      serializeJson(doc, out);
+      ws.textAll(out);
+    }
+
+    ws.cleanupClients();
+    vTaskDelay(pdMS_TO_TICKS(50)); 
+  }
+}
+
+// ============================================================
+//                                SETUP
+// ============================================================
+void setup() {
+  // [THÊM] Cấu hình và kích hoạt lõi Hardware Task Watchdog Timer cho hệ thống
+  // [SỬA TẠI ĐÂY]: Khởi tạo Watchdog phần cứng theo chuẩn ESP32 Core v3.x
+  esp_task_wdt_config_t wdt_config = {
+    .timeout_ms = WDT_TIMEOUT_SECONDS * 1000, // Đổi từ giây sang mili-giây
+    .idle_core_mask = (1 << portNUM_PROCESSORS) - 1, // Giám sát lỗi trên tất cả các lõi CPU
+    .trigger_panic = true // Tự động Hard Reset (Reboot) chip khi bị treo kẹt
+  };
+  
+  // Truyền con trỏ cấu hình vào hàm khởi tạo
+  esp_task_wdt_init(&wdt_config); 
+  
+  Serial.println("Kích hoạt Hardware Task Watchdog Timer v3.x thành công!");
+
+  Serial.begin(115200);
+  RADAR_SERIAL.begin(RADAR_BAUD, SERIAL_8N1, RADAR_RX_PIN, RADAR_TX_PIN);
+
+  xRadarQueue   = xQueueCreate(20, sizeof(RadarRaw));
+  xResultMutex  = xSemaphoreCreateMutex();
+  xZoneMutex    = xSemaphoreCreateMutex();
+
+  memset(&tsRooms,       0, sizeof(tsRooms));
+  memset(&sharedResults, 0, sizeof(sharedResults));
+  
+  for(int i=0; i<NUM_ROOMS; i++){
+    sharedResults[i].valid = false;
+  }
+
+  xTaskCreatePinnedToCore(Task_Radar,     "Task_Radar",     4096, NULL, 3, NULL, 0);
+  xTaskCreatePinnedToCore(Task_Logic,     "Task_Logic",     8192, NULL, 2, NULL, 0);
+  xTaskCreatePinnedToCore(Task_WebServer, "Task_WebServer", 8192, NULL, 1, NULL, 1);
+
+  Serial.println("Hệ thống đa phòng tích hợp dữ liệu mô phỏng đã sẵn sàng");
 }
 
 void loop() {
-  handleRadar();
-  ws.cleanupClients();
+  vTaskDelay(pdMS_TO_TICKS(1000));
 }
